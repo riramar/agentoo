@@ -1,0 +1,199 @@
+#!/usr/bin/python
+# Small wrapper around portages aux_get() function. Basically just a CLI interface to it.
+# Author: Marius Mauch <genone@gentoo.org>
+# This script is licensed under the GNU Public License version 2 or later
+
+import sys
+
+try:
+	from metalib import *
+except ImportError:
+	sys.stderr.write("Could not import metalib.py. Maybe you forgot to download it?")
+	sys.exit(1)
+
+# setting up defaults
+config = {}
+config["showHeaders"] = True
+config["resolveDepStrings"] = False
+config["stripAtoms"] = False
+config["db"] = portage.db["/"]["porttree"].dbapi
+config["auxkeys"] = [k for k in portage.auxdbkeys if not k.startswith("UNUSED")]
+config["bashOutput"] = False
+config["showCpv"] = False
+config["ignoreMask"] = False
+config["allVersions"] = False
+
+optionmap_common = [
+["-h", "--help", "show this help message"],
+["-i", "--vardb", "use vardb instead of PORTDIR for lookups (limited functionality)"],
+["-n", "--no-header", "don't show variable names (useful for single-var queries)"],
+["-r", "--resolve-conditionals", "evaluate the dep strings to remove conditionals"],
+["-p", "--package-name", "strip operators and versions from package names"],
+["-m", "--ignore-masking", "always use the latest version ignoring all masks"],
+]
+optionmap_single = [
+["-c", "--show-cpv", "additionally display the selected cpv (CPV: <cat>/pkg>-<ver>)"],
+["-b", "--bash-output", "generate bash compatible assignments (overrides -n)"],
+]
+optionmap_mass = [
+["-a", "--all-versions", "list all versions matched by the atom"]
+]
+
+syntax_single = "%s <options> <atom> [key ...]"
+syntax_mass = "%s <options> [key ...] [atom ...]"
+
+def isMassCall(arg0):
+	return (arg0.endswith("mass_auxget"))
+
+if isMassCall(sys.argv[0]):
+	syntax = syntax_mass
+	optionmap = (optionmap_common+optionmap_mass)
+else:
+	syntax = syntax_single
+	optionmap = (optionmap_common+optionmap_single)
+
+def parseArgs(args):
+	global config, optionmap
+	# option parsing
+	args = []
+	params = []
+	try:
+		short_opts = "".join([x[0][1] for x in optionmap])
+		long_opts = [x[1] for x in optionmap]
+
+		args, params = getopt.getopt(sys.argv[1:], short_opts, long_opts)
+		for option,value in args:
+			if option in ["-i", "--vardb"]:
+				sys.stderr.write("WARNING: --vardb only supports a subset of the available keys and doesn't support the additional vardb keys.\n")
+				config["db"] = portage.db["/"]["vartree"].dbapi
+				# vdb and ignoreMask don't work with each other
+				config["ignoreMask"] = False
+			elif option in ["-r", "--resolve-deps"]:
+				config["resolveDepStrings"] = True
+			elif option in ["-n", "--no-header"]:
+				config["showHeaders"] = False
+			elif option in ["-h", "--help"]:
+				show_help(EXIT_SUCCESS, optionmap, syntax)
+			elif option in ["-p", "--package-name"]:
+				config["stripAtoms"] = True
+			elif option in ["-b", "--bash-output"]:
+				config["bashOutput"] = True
+			elif option in ["-c", "--show-cpv"]:
+				config["showCpv"] = True
+			elif option in ["-m", "--ignore-masking"]:
+				if config["db"] == portage.db["/"]["porttree"].dbapi:
+					config["ignoreMask"] = True
+			elif option in ["-a", "--all-options"]:
+				config["allVersions"] = True
+
+	# we got an invalid option
+	except getopt.GetoptError, e:
+		sys.stderr.write("unknown option given: " + str(e) + "\n")
+		show_help(EXIT_FAILURE, optionmap, syntax)
+
+	if len(params) < 1 and not isMassCall(sys.argv[0]):
+		sys.stderr.write("ERROR: invalid number of arguments\n")
+		show_help(EXIT_FAILURE, optionmap, syntax)
+	return params
+
+def getData(package, keys):
+	db = config["db"]
+
+	if isvalidatom(package):
+		if config["ignoreMask"]:
+			cpv = portage.best(db.xmatch("match-all", package))
+		else:
+			cpv = portage.best(db.match(package))
+	else:
+		sys.stderr.write("ERROR: %s is not a valid atom\n" % package)
+		return (EXIT_FAILURE, [], [])
+
+	if cpv == "":
+		sys.stderr.write("no matching packages found for '%s'\n" % package)
+		return (EXIT_NORESULT, [], [])
+
+	values = db.aux_get(cpv, keys)
+
+	# remove conditional deps whose coditions aren't met
+	if config["resolveDepStrings"]:
+		values = resolve_dep_strings(cpv, keys, values)
+
+	# user requested only package names			
+	if config["stripAtoms"]:
+		values = strip_atoms(keys, values)
+
+	if config["showCpv"]:
+		keys.insert(0, "CPV")
+		values.insert(0, cpv)
+
+	return (cpv, keys, values)
+
+def main_mass(args):
+	db = config["db"]
+
+	keys = []
+	pos = 0
+	for x in args:
+		if x in config["auxkeys"]:
+			keys.append(x)
+			pos += 1
+	if len(keys) == 0:
+		keys = config["auxkeys"]
+
+	if len(args) > pos:
+		atoms = args[pos:]
+	else:
+		sys.stderr.write("Looking up all packages ...")
+		atoms = db.cp_all()
+		sys.stderr.write(" done\n")
+	
+	# This solution is crap, but can't think of anything better offhand
+	if config["allVersions"]:
+		sys.stderr.write("Searching for all versions for all given atoms ...")
+		mylist = []
+		for a in atoms:
+			if config["ignoreMask"]:
+				mylist.extend(["="+x for x in db.xmatch("match-all", a)])
+			else:
+				mylist.extend(["="+x for x in db.match(a)])
+		sys.stderr.write(" done\n")
+		atoms = mylist
+	
+	for p in atoms:
+		cpv, keys, values = getData(p, keys)
+		if cpv == EXIT_NORESULT or cpv == EXIT_FAILURE:
+			sys.exit(values)
+		sys.stdout.write(cpv+": ")
+		for i in range(0, len(values)):
+			if config["showHeaders"]:
+				sys.stdout.write(keys[i]+"=\""+values[i]+"\" ")
+			else:
+				sys.stdout.write("\""+values[i]+"\" ")
+		sys.stdout.write("\n")
+
+	return EXIT_SUCCESS
+
+def main_single(args):
+	package = args[0]
+	if len(args) == 1:
+		keys = config["auxkeys"]
+	else:
+		keys = args[1:]
+
+	cpv, keys, values = getData(package, keys)
+
+	for i in range(0, len(values)):
+		if config["bashOutput"]:
+			sys.stdout.write("%s=\"%s\"\n" % (keys[i], values[i]))
+		elif config["showHeaders"]:
+			sys.stdout.write("%12s: %s\n" % (keys[i], values[i]))
+		else:
+			sys.stdout.write("%s\n" % values[i])
+
+	return EXIT_SUCCESS
+
+if __name__ == "__main__":
+	if isMassCall(sys.argv[0]):
+		sys.exit(main_mass(parseArgs(sys.argv)))
+	else:
+		sys.exit(main_single(parseArgs(sys.argv)))

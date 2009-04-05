@@ -1,0 +1,174 @@
+#!/usr/bin/python
+# 
+# Script to find packages/ebuilds matching certain metadata criteria. Examples:
+# - find all packages in the tree supporting the berkdb use flag: metascan IUSE berkdb
+# - find all packages in the tree providing an mta: metascan PROVIDE virtual/mta
+# - find all packages in the tree providing an mta and not supporting the maildir use flag:
+# 		metascan -a -- PROVIDE virtual/mta -IUSE maildir
+# - find all installed packages containing net-nds/openldap in DEPEND or RDEPEND:
+# 		metascan -i -n DEPEND net-nds/openldap RDEPEND net-nds/openldap
+#
+# Author: Marius Mauch <genone@gentoo.org>
+# This script is licensed under the GNU Public License version 2 or later
+
+import sys
+
+try:
+	from metalib import *
+except ImportError:
+	sys.stderr.write("Could not import metalib.py. Maybe you forgot to download it?")
+	sys.exit(1)
+
+import os
+
+NEGATION = "-"
+
+# setting up defaults
+limit = None
+verbose = False
+sort = False
+db = portage.db["/"]["porttree"].dbapi
+operator = "or"
+stripAtoms = False
+partial = False
+resolveDepStrings = False
+debug=0
+regex=False
+
+lastsync_timestampfile = portage.settings["PORTDIR"]+"/metadata/timestamp.chk"
+
+# Map of all long and schort options and their descriptions
+optionmap = [
+["-h", "--help", "show this help message"],
+["-l", "--limit", "limits the search to the given categories"],
+["-s", "--sort", "sort the result list"],
+["-v", "--verbose", "show all matching cpv entries, not just the package names"],
+["-i", "--vardb", "use vardb instead of porttree as database"],
+["-a", "--and", "use AND instead of OR when using multiple queries"],
+["-p", "--partial", "also reports partial matches (not recommended)"],
+["-d", "--debug", "print debug output (use twice for more output)"],
+["-n", "--package-name", "strip operators and version numbers from DEPEND strings"],
+["-c", "--resolve-conditionals", "evaluate the dep strings to remove conditionals"],
+["-x", "--regular-expressions", "interpret value arguments as regular expresions (for experts only)"]
+]
+
+syntax = "%s [<options>] [--] <key> <value> ..."
+
+# option parsing
+args = []
+params = []
+
+i=1
+for x in sys.argv[1:][:]:
+	if len(x) > 2 and x[0] == "-" and x[1].isupper():
+		sys.argv.insert(i, "--")
+	i=i+1
+
+try:
+	args, params = getopt.gnu_getopt(sys.argv[1:], "il:svanhpcdx", \
+		["limit=", "sort", "verbose", "installed", "help", "and", 
+		 "vardb", "package-name", "partial", "resolve-conditionals", "debug", 
+		 "regular-expressions"])
+	for option,value in args:
+		if option in ["-l", "--limit"]:
+			limit = value.lstrip("=").split(",")
+		elif option in ["-s", "--sort"]:
+			sort = True
+		elif option in ["-v", "--verbose"]:
+			verbose = True
+		elif option in ["-h", "--help"]:
+			show_help(EXIT_SUCCESS, optionmap, syntax)
+		elif option in ["-i", "--vardb"]:
+			db = portage.db["/"]["vartree"].dbapi
+		elif option in ["-a", "--and"]:
+			operator = "and"
+		elif option in ["-n", "--package-name"]:
+			stripAtoms = True
+		elif option in ["-p", "--partial"]:
+			partial = True
+		elif option in ["-c", "--resolve-conditionals"]:
+			resolveDepStrings = True
+		elif option in ["-d", "--debug"]:
+			debug += 1
+		elif option in ["-x", "--regular-expressions"]:
+			regex = True
+			import re
+
+# we got an invalid option
+except getopt.GetoptError, e:
+	sys.stderr.write("unknown option given: " + str(e) + "\n")
+	show_help(EXIT_FAILURE, optionmap, syntax)
+
+while "--" in params:
+	params.remove("--")
+
+# we need an even number of arguments
+if len(params) < 2 or len(params) % 2 != 0:
+	sys.stderr.write("ERROR: invalid number of arguments: need (key, value) pairs\n")
+	show_help(EXIT_FAILURE, optionmap, syntax)
+
+# parse our arguments and check them for validity
+keys = []
+values = []
+negated = []
+for i in range(0, len(params)):
+	if i % 2 == 0:
+		if params[i][0] == NEGATION:
+			negated.append(True)
+			keys.append(params[i][1:])
+		else:
+			negated.append(False)
+			keys.append(params[i])
+		if not keys[i/2] in portage.auxdbkeys:
+			sys.stderr.write("ERROR: provided key \"%s\" is invalid.\n" % keys[i/2])
+			show_help(EXIT_FAILURE, optionmap, syntax)
+	elif i % 2 == 1:
+			values.append(params[i])
+
+# some option sanity checks
+if partial and regex:
+	sys.stderr.write("--regular-expressions and --partial are mutually exclusive. Choose one.\n\n")
+	sys.exit(EXIT_FAILURE)
+
+if debug > 0:
+	sys.stderr.write("Options: %s\n" % str(sys.argv[1:]))
+	sys.stderr.write("Keys:    %s\n" % str(keys))
+	sys.stderr.write("Negated: %s\n" % str(negated))
+	sys.stderr.write("Values:  %s\n" % str(values))
+
+scanlist = {}
+
+sys.stderr.write("Generating package list ... ")
+sys.stderr.flush()
+plist = db.cp_all()
+if sort and debug:
+	plist.sort()
+for p in plist:
+	scanlist[p] = []
+	for pv in db.cp_list(p):
+		scanlist[p].append(pv)
+sys.stderr.write("done\n")
+
+if debug > 0:
+	sys.stderr.write("Number of packages in package list: %d\n" % len(scanlist))
+	sys.stderr.write("Number of ebuilds in package list:  %d\n" % sum([len(scanlist[x]) for x in scanlist]))
+
+sys.stderr.write("Scanning packages for %s ... " % str(keys))
+sys.stderr.flush()
+
+# now get to the real job ...
+resultlist = metascan(db, keys, values, negated, scanlist=scanlist, operator=operator, resolveDepStrings=resolveDepStrings, stripAtoms=stripAtoms, partial=partial, regex=regex, catlimit=limit, debug=debug, verbose=verbose)
+
+sys.stderr.write("done\n\n")
+
+# finally output our result
+if sort:
+	resultlist.sort()
+
+if len(resultlist) == 0:
+	sys.stderr.write("no matches found\n")
+	sys.exit(EXIT_NORESULT)
+else:	
+	for x in resultlist:
+		sys.stdout.write(x+"\n")
+sys.exit(EXIT_SUCCESS)
